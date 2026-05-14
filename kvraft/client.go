@@ -2,16 +2,17 @@ package kvraft
 
 import (
 	"crypto/rand"
+	"infra/labrpc"
 	"math/big"
 	"sync"
-
-	"infra/labrpc"
 )
 
 type Clerk struct {
 	servers    []*labrpc.ClientEnd
 	currLeader int
 	mu         sync.Mutex
+	clientId   int64
+	seqId      int
 }
 
 func nrand() int64 {
@@ -26,8 +27,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	// Start a goroutine to connect to server, each operation with its unique nrand
-	// Call kvserver handler to handler coresponding op
-	// Prepare args and reply
+	// Call kvserver handler to handle coresponding op
+	ck.currLeader = 0
+	ck.clientId = nrand()
+	ck.seqId = 0
 	return ck
 }
 
@@ -46,25 +49,38 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	// Make a new Clerk
 	var err Err
-	unum := nrand()
+
+	ck.mu.Lock()
+	unum := ck.seqId
+	ck.seqId++
+	ck.mu.Unlock()
+
 	reply := GetReply{}
 	for err != "OK" {
 		args := GetArgs{
-			SeqId: unum,
-			Key:   key,
+			SeqId:    unum,
+			Key:      key,
+			ClientId: ck.clientId,
 		}
-		ok := ck.servers[ck.currLeader].Call("KVServer.Get", &args, reply)
+		ok := ck.servers[ck.currLeader].Call("KVServer.Get", &args, &reply)
 		if ok {
 			ck.mu.Lock()
 			err = reply.Err
 			switch reply.Err {
 			case ErrWrongLeader:
-				ck.updateLeader(reply.LeaderId)
+				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
+			case ErrTimeOut:
+				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
 			case ErrNoKey:
+				ck.mu.Unlock()
 				return ""
 			case OK:
 				break
 			}
+			ck.mu.Unlock()
+		} else {
+			ck.mu.Lock()
+			ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
 			ck.mu.Unlock()
 		}
 	}
@@ -83,26 +99,37 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	var err Err
-	unum := nrand()
+
+	ck.mu.Lock()
+	unum := ck.seqId
+	ck.seqId++
+	ck.mu.Unlock()
+
 	reply := PutAppendReply{}
 	for err != "OK" {
 		args := PutAppendArgs{
-			Key:       key,
-			Value:     value,
-			Op:        op,
-			UniqueNum: unum,
+			Key:      key,
+			Value:    value,
+			Op:       op,
+			SeqId:    unum,
+			ClientId: ck.clientId,
 		}
-		ok := ck.servers[ck.currLeader].Call("KVServer.PutAppend", &args, reply)
+		ok := ck.servers[ck.currLeader].Call("KVServer.PutAppend", &args, &reply)
 		if ok {
 			ck.mu.Lock()
 			err = reply.Err
 			switch reply.Err {
 			case ErrWrongLeader:
-				ck.updateLeader(reply.LeaderId)
-			case ErrNoKey:
+				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
+			case ErrTimeOut:
+				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
 			case OK:
-				break
+				return
 			}
+			ck.mu.Unlock()
+		} else {
+			ck.mu.Lock()
+			ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
 			ck.mu.Unlock()
 		}
 	}
@@ -113,8 +140,4 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
-}
-
-func (ck *Clerk) updateLeader(leaderId int) {
-	ck.currLeader = leaderId
 }

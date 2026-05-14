@@ -8,6 +8,7 @@ import (
 	"infra/labgob"
 	"infra/labrpc"
 	"infra/raft"
+	"time"
 )
 
 const Debug = false
@@ -23,50 +24,133 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type  string
-	Key   string
+	Type     string
+	Key      string
+	Value    string
+	SeqId    int
+	ClientId int64
+}
+
+type OpReply struct {
+	Err   Err
 	Value string
-	SeqId int64
+}
+
+type LastOpRecord struct {
+	lastSeqId int
+	lastReply OpReply
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
-
-	maxraftstate int // snapshot if log grows this big
-
-	commitIndex int
-	leaderId    int
+	mu           sync.Mutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	notifyChans  map[int]chan OpReply
+	dead         int32 // set by Kill()
+	maxraftstate int   // snapshot if log grows this big
+	commitIndex  int
+	leaderId     int
+	kvStore      map[string]string
+	recordMap    map[int64]LastOpRecord
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	// make a command
 
-	for !kv.killed() {
+	if !kv.killed() {
 		command := Op{
-			Type:  "Get",
-			Key:   args.Key,
-			SeqId: args.SeqId,
+			Type:     "Get",
+			Key:      args.Key,
+			SeqId:    args.SeqId,
+			ClientId: args.ClientId,
 		}
-		_, _, isLeader := kv.rf.Start(command)
+		kv.mu.Lock()
+		if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.lastSeqId {
+			reply.Value = record.lastReply.Value
+			reply.Err = record.lastReply.Err
+			kv.mu.Unlock()
+			return
+		}
+		kv.mu.Unlock()
+		index, startTerm, isLeader := kv.rf.Start(command)
+
+		kv.mu.Lock()
+
 		if !isLeader {
 			reply.LeaderId = kv.leaderId
 			reply.Err = ErrWrongLeader
+			kv.mu.Unlock()
 			return
 		}
 
-		// start a goroutine to wait for commitment
+		// build a channel using index, then wait OpReply from channel
+		kv.notifyChans[index] = make(chan OpReply, 1)
+		kv.mu.Unlock()
 
+		select {
+		case opreply := <-kv.notifyChans[index]:
+			currTerm, isLeader := kv.rf.GetState()
+			if !isLeader || currTerm != startTerm {
+				reply.Err = ErrWrongLeader
+			} else {
+				reply.Value = opreply.Value
+				reply.Err = opreply.Err
+			}
+		case <-time.After(500 * time.Millisecond):
+			reply.Err = ErrTimeOut
+		}
+		kv.mu.Lock()
+		delete(kv.notifyChans, index)
+		kv.mu.Unlock()
 	}
 
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if !kv.killed() {
+
+		command := Op{
+			Type:     args.Op,
+			Key:      args.Key,
+			Value:    args.Value,
+			SeqId:    args.SeqId,
+			ClientId: args.ClientId,
+		}
+
+		idx, startTerm, isLeader := kv.rf.Start(command)
+
+		kv.mu.Lock()
+
+		if !isLeader {
+			reply.LeaderId = kv.leaderId
+			reply.Err = ErrWrongLeader
+			kv.mu.Unlock()
+			return
+		}
+
+		kv.notifyChans[idx] = make(chan OpReply, 1)
+		kv.mu.Unlock()
+
+		select {
+		case opreply := <-kv.notifyChans[idx]:
+			currTerm, isLeader := kv.rf.GetState()
+			kv.mu.Lock()
+			if !isLeader || currTerm > startTerm {
+				reply.Err = ErrWrongLeader
+			} else {
+				reply.Err = opreply.Err
+			}
+			kv.mu.Unlock()
+		case <-time.After(500 * time.Millisecond):
+			reply.Err = ErrTimeOut
+		}
+		kv.mu.Lock()
+		delete(kv.notifyChans, idx)
+		kv.mu.Unlock()
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -108,14 +192,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
+	kv.kvStore = make(map[string]string)
+	kv.notifyChans = make(map[int]chan OpReply)
 	kv.commitIndex = 0
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.recordMap = make(map[int64]LastOpRecord)
 
 	go kv.applier()
-	// You may need initialization code here.
 
 	return kv
 }
@@ -129,25 +213,74 @@ func (kv *KVServer) applier() {
 			// whether get can be applied
 			kv.commitIndex = msg.CommandIndex
 			cmd := msg.Command.(Op)
-			switch cmd.Type {
-			case "Get":
-				kv.getHandler()
-			case "Put":
-				kv.putHandler()
-			case "Append":
-				kv.appendHandler()
+			idx := msg.CommandIndex
+
+			var reply OpReply
+
+			kv.mu.Lock()
+			if record, ok := kv.recordMap[cmd.ClientId]; ok && record.lastSeqId >= cmd.SeqId {
+				reply = record.lastReply
+			} else {
+				reply = kv.applyToStateMachine(cmd)
 			}
+
+			kv.recordMap[cmd.ClientId] = LastOpRecord{
+				lastSeqId: cmd.SeqId,
+				lastReply: reply,
+			}
+
+			if notifyChan, ok := kv.notifyChans[idx]; ok {
+				notifyChan <- reply
+			}
+			kv.mu.Unlock()
 		}
 	}
 }
 
-func (kv *KVServer) getHandler() {
-
+func (kv *KVServer) applyToStateMachine(cmd Op) OpReply {
+	var reply OpReply
+	switch cmd.Type {
+	case "Get":
+		reply = kv.getHandler(cmd)
+	case "Put":
+		reply = kv.putHandler(cmd)
+	case "Append":
+		reply = kv.appendHandler(cmd)
+	}
+	return reply
 }
 
-func (kv *KVServer) putHandler() {
-
+func (kv *KVServer) getHandler(cmd Op) OpReply {
+	// handle cmd to state machine if it's leader
+	// return the result
+	// otherwise(dead, leader change) return err
+	var reply OpReply
+	if val, ok := kv.kvStore[cmd.Key]; ok {
+		reply = OpReply{
+			Value: val,
+			Err:   OK,
+		}
+	} else {
+		reply = OpReply{
+			Err: ErrNoKey,
+		}
+	}
+	return reply
 }
-func (kv *KVServer) appendHandler() {
 
+func (kv *KVServer) putHandler(cmd Op) OpReply {
+	var reply OpReply
+	kv.kvStore[cmd.Key] = cmd.Value
+	reply = OpReply{
+		Err: OK,
+	}
+	return reply
+}
+func (kv *KVServer) appendHandler(cmd Op) OpReply {
+	var reply OpReply
+	kv.kvStore[cmd.Key] += cmd.Value
+	reply = OpReply{
+		Err: OK,
+	}
+	return reply
 }
