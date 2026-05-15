@@ -5,6 +5,7 @@ import (
 	"infra/labrpc"
 	"math/big"
 	"sync"
+	"time"
 )
 
 type Clerk struct {
@@ -55,37 +56,45 @@ func (ck *Clerk) Get(key string) string {
 	ck.seqId++
 	ck.mu.Unlock()
 
-	reply := GetReply{}
 	for err != "OK" {
 		args := GetArgs{
 			SeqId:    unum,
 			Key:      key,
 			ClientId: ck.clientId,
 		}
+		reply := GetReply{}
 		ok := ck.servers[ck.currLeader].Call("KVServer.Get", &args, &reply)
+		needSleep := false
 		if ok {
 			ck.mu.Lock()
 			err = reply.Err
 			switch reply.Err {
 			case ErrWrongLeader:
 				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
+				needSleep = true
 			case ErrTimeOut:
 				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
+				needSleep = true
 			case ErrNoKey:
 				ck.mu.Unlock()
 				return ""
 			case OK:
-				break
+				ck.mu.Unlock()
+				return reply.Value
 			}
 			ck.mu.Unlock()
 		} else {
 			ck.mu.Lock()
 			ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
 			ck.mu.Unlock()
+			needSleep = true
+		}
+		if needSleep {
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
-	return reply.Value
+	return ""
 }
 
 // shared by Put and Append.
@@ -105,7 +114,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.seqId++
 	ck.mu.Unlock()
 
-	reply := PutAppendReply{}
 	for err != "OK" {
 		args := PutAppendArgs{
 			Key:      key,
@@ -114,16 +122,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			SeqId:    unum,
 			ClientId: ck.clientId,
 		}
+		reply := PutAppendReply{}
 		ok := ck.servers[ck.currLeader].Call("KVServer.PutAppend", &args, &reply)
+		needSleep := false
 		if ok {
 			ck.mu.Lock()
 			err = reply.Err
 			switch reply.Err {
 			case ErrWrongLeader:
 				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
+				needSleep = true
 			case ErrTimeOut:
 				ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
+				needSleep = true
 			case OK:
+				ck.mu.Unlock()
 				return
 			}
 			ck.mu.Unlock()
@@ -131,6 +144,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.mu.Lock()
 			ck.currLeader = (ck.currLeader + 1) % len(ck.servers)
 			ck.mu.Unlock()
+			needSleep = true
+		}
+		if needSleep {
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }

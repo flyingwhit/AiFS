@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -37,8 +39,8 @@ type OpReply struct {
 }
 
 type LastOpRecord struct {
-	lastSeqId int
-	lastReply OpReply
+	LastSeqId int
+	LastReply OpReply
 }
 
 type KVServer struct {
@@ -53,6 +55,7 @@ type KVServer struct {
 	leaderId     int
 	kvStore      map[string]string
 	recordMap    map[int64]LastOpRecord
+	persister    *raft.Persister
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -67,16 +70,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			ClientId: args.ClientId,
 		}
 		kv.mu.Lock()
-		if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.lastSeqId {
-			reply.Value = record.lastReply.Value
-			reply.Err = record.lastReply.Err
+		if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
+			reply.Value = record.LastReply.Value
+			reply.Err = record.LastReply.Err
 			kv.mu.Unlock()
 			return
 		}
-		kv.mu.Unlock()
-		index, startTerm, isLeader := kv.rf.Start(command)
 
-		kv.mu.Lock()
+		index, startTerm, isLeader := kv.rf.Start(command)
+		kv.notifyChans[index] = make(chan OpReply, 1)
 
 		if !isLeader {
 			reply.LeaderId = kv.leaderId
@@ -86,18 +88,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		}
 
 		// build a channel using index, then wait OpReply from channel
-		kv.notifyChans[index] = make(chan OpReply, 1)
 		kv.mu.Unlock()
 
 		select {
 		case opreply := <-kv.notifyChans[index]:
 			currTerm, isLeader := kv.rf.GetState()
+			kv.mu.Lock()
 			if !isLeader || currTerm != startTerm {
 				reply.Err = ErrWrongLeader
 			} else {
 				reply.Value = opreply.Value
 				reply.Err = opreply.Err
+				kv.leaderId = kv.me
 			}
+			kv.mu.Unlock()
 		case <-time.After(500 * time.Millisecond):
 			reply.Err = ErrTimeOut
 		}
@@ -120,10 +124,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			ClientId: args.ClientId,
 		}
 
-		idx, startTerm, isLeader := kv.rf.Start(command)
-
 		kv.mu.Lock()
 
+		if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
+			reply.Err = record.LastReply.Err
+			kv.mu.Unlock()
+			return
+		}
+
+		idx, startTerm, isLeader := kv.rf.Start(command)
 		if !isLeader {
 			reply.LeaderId = kv.leaderId
 			reply.Err = ErrWrongLeader
@@ -138,10 +147,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		case opreply := <-kv.notifyChans[idx]:
 			currTerm, isLeader := kv.rf.GetState()
 			kv.mu.Lock()
-			if !isLeader || currTerm > startTerm {
+			if !isLeader || currTerm != startTerm {
 				reply.Err = ErrWrongLeader
 			} else {
 				reply.Err = opreply.Err
+				kv.leaderId = kv.me
 			}
 			kv.mu.Unlock()
 		case <-time.After(500 * time.Millisecond):
@@ -198,6 +208,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.recordMap = make(map[int64]LastOpRecord)
+	kv.persister = persister
+	labgob.Register(Op{})
+	labgob.Register(OpReply{})
+	labgob.Register(LastOpRecord{})
+
+	// restore snapshot when rebooting, if len(snapshot) > 0
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.restoreSnapshot(snapshot)
+	}
 
 	go kv.applier()
 
@@ -211,26 +231,59 @@ func (kv *KVServer) applier() {
 			// Apply cmd from chan one by one, each time take a cmd
 			// send it to coresponding handler. set index to check
 			// whether get can be applied
-			kv.commitIndex = msg.CommandIndex
 			cmd := msg.Command.(Op)
 			idx := msg.CommandIndex
 
 			var reply OpReply
 
 			kv.mu.Lock()
-			if record, ok := kv.recordMap[cmd.ClientId]; ok && record.lastSeqId >= cmd.SeqId {
-				reply = record.lastReply
+			kv.commitIndex = msg.CommandIndex
+			if record, ok := kv.recordMap[cmd.ClientId]; ok && record.LastSeqId >= cmd.SeqId {
+				reply = record.LastReply
 			} else {
 				reply = kv.applyToStateMachine(cmd)
 			}
 
 			kv.recordMap[cmd.ClientId] = LastOpRecord{
-				lastSeqId: cmd.SeqId,
-				lastReply: reply,
+				LastSeqId: cmd.SeqId,
+				LastReply: reply,
+			}
+
+			// check whether need to snapshot or not
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.kvStore)
+				e.Encode(kv.recordMap)
+				data := w.Bytes()
+				kv.mu.Unlock()
+				kv.rf.Snapshot(kv.commitIndex, data)
+				kv.mu.Lock()
 			}
 
 			if notifyChan, ok := kv.notifyChans[idx]; ok {
 				notifyChan <- reply
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			// msg is a snapshot
+			// check snapshot index to dicide whether to update
+			kv.mu.Lock()
+			if msg.SnapshotIndex > kv.commitIndex {
+				kv.commitIndex = msg.SnapshotIndex
+				kv.restoreSnapshot(msg.Snapshot)
+
+				var toDelete []int
+				for idx, ch := range kv.notifyChans {
+					select {
+					case ch <- OpReply{Err: ErrWrongLeader}:
+						toDelete = append(toDelete, idx)
+					default:
+					}
+				}
+				for _, idx := range toDelete {
+					delete(kv.notifyChans, idx)
+				}
 			}
 			kv.mu.Unlock()
 		}
@@ -283,4 +336,20 @@ func (kv *KVServer) appendHandler(cmd Op) OpReply {
 		Err: OK,
 	}
 	return reply
+}
+
+func (kv *KVServer) restoreSnapshot(data []byte) {
+	// Decode data from msg
+	// and restore recordMap and kvstore
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var recordMap map[int64]LastOpRecord
+	var kvStore map[string]string
+	if d.Decode(&kvStore) != nil || d.Decode(&recordMap) != nil {
+		fmt.Printf("restore snapshot error\n")
+	} else {
+		kv.kvStore = kvStore
+		kv.recordMap = recordMap
+	}
+
 }
