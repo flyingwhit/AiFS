@@ -433,12 +433,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Unlock()
 
 	// Inform server to update
-	rf.applyCh <- ApplyMsg{
+	go func(msg ApplyMsg) {
+		rf.applyCh <- msg
+	}(ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
 		SnapshotIndex: snapshotIndex,
 		SnapshotTerm:  snapshotTerm,
-	}
+	})
 }
 
 // example code to send a RequestVote RPC to a server.

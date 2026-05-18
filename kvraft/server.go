@@ -56,111 +56,151 @@ type KVServer struct {
 	kvStore      map[string]string
 	recordMap    map[int64]LastOpRecord
 	persister    *raft.Persister
+	httpSeq      int64
+}
+
+func (kv *KVServer) waitApplied(index int, startTerm int) (OpReply, Err) {
+	ch := make(chan OpReply, 1)
+	kv.mu.Lock()
+	kv.notifyChans[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case opreply := <-ch:
+		currTerm, isLeader := kv.rf.GetState()
+		if !isLeader || currTerm != startTerm {
+			return opreply, ErrWrongLeader
+		}
+		return opreply, OK
+	case <-time.After(500 * time.Millisecond):
+		return OpReply{}, ErrTimeOut
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	// make a command
-
-	if !kv.killed() {
-		command := Op{
-			Type:     "Get",
-			Key:      args.Key,
-			SeqId:    args.SeqId,
-			ClientId: args.ClientId,
-		}
-		kv.mu.Lock()
-		if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
-			reply.Value = record.LastReply.Value
-			reply.Err = record.LastReply.Err
-			kv.mu.Unlock()
-			return
-		}
-
-		index, startTerm, isLeader := kv.rf.Start(command)
-		kv.notifyChans[index] = make(chan OpReply, 1)
-
-		if !isLeader {
-			reply.LeaderId = kv.leaderId
-			reply.Err = ErrWrongLeader
-			kv.mu.Unlock()
-			return
-		}
-
-		// build a channel using index, then wait OpReply from channel
-		kv.mu.Unlock()
-
-		select {
-		case opreply := <-kv.notifyChans[index]:
-			currTerm, isLeader := kv.rf.GetState()
-			kv.mu.Lock()
-			if !isLeader || currTerm != startTerm {
-				reply.Err = ErrWrongLeader
-			} else {
-				reply.Value = opreply.Value
-				reply.Err = opreply.Err
-				kv.leaderId = kv.me
-			}
-			kv.mu.Unlock()
-		case <-time.After(500 * time.Millisecond):
-			reply.Err = ErrTimeOut
-		}
-		kv.mu.Lock()
-		delete(kv.notifyChans, index)
-		kv.mu.Unlock()
+	if kv.killed() {
+		return
 	}
 
+	command := Op{
+		Type:     "Get",
+		Key:      args.Key,
+		SeqId:    args.SeqId,
+		ClientId: args.ClientId,
+	}
+
+	kv.mu.Lock()
+	if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
+		reply.Value = record.LastReply.Value
+		reply.Err = record.LastReply.Err
+		kv.mu.Unlock()
+		return
+	}
+
+	index, startTerm, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.LeaderId = kv.leaderId
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	opreply, err := kv.waitApplied(index, startTerm)
+
+	kv.mu.Lock()
+	delete(kv.notifyChans, index)
+	if err == OK {
+		reply.Value = opreply.Value
+		reply.Err = opreply.Err
+		kv.leaderId = kv.me
+	} else {
+		reply.Err = err
+	}
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) Delete(args *DeleteArgs, reply *DeleteReply) {
+	if kv.killed() {
+		return
+	}
+
+	command := Op{
+		Type:     "Delete",
+		Key:      args.Key,
+		SeqId:    args.SeqId,
+		ClientId: args.ClientId,
+	}
+
+	kv.mu.Lock()
+	if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
+		reply.Err = record.LastReply.Err
+		kv.mu.Unlock()
+		return
+	}
+
+	index, startTerm, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.LeaderId = kv.leaderId
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	opreply, err := kv.waitApplied(index, startTerm)
+
+	kv.mu.Lock()
+	delete(kv.notifyChans, index)
+	if err == OK {
+		reply.Err = opreply.Err
+		kv.leaderId = kv.me
+	} else {
+		reply.Err = err
+	}
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	if !kv.killed() {
-
-		command := Op{
-			Type:     args.Op,
-			Key:      args.Key,
-			Value:    args.Value,
-			SeqId:    args.SeqId,
-			ClientId: args.ClientId,
-		}
-
-		kv.mu.Lock()
-
-		if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
-			reply.Err = record.LastReply.Err
-			kv.mu.Unlock()
-			return
-		}
-
-		idx, startTerm, isLeader := kv.rf.Start(command)
-		if !isLeader {
-			reply.LeaderId = kv.leaderId
-			reply.Err = ErrWrongLeader
-			kv.mu.Unlock()
-			return
-		}
-
-		kv.notifyChans[idx] = make(chan OpReply, 1)
-		kv.mu.Unlock()
-
-		select {
-		case opreply := <-kv.notifyChans[idx]:
-			currTerm, isLeader := kv.rf.GetState()
-			kv.mu.Lock()
-			if !isLeader || currTerm != startTerm {
-				reply.Err = ErrWrongLeader
-			} else {
-				reply.Err = opreply.Err
-				kv.leaderId = kv.me
-			}
-			kv.mu.Unlock()
-		case <-time.After(500 * time.Millisecond):
-			reply.Err = ErrTimeOut
-		}
-		kv.mu.Lock()
-		delete(kv.notifyChans, idx)
-		kv.mu.Unlock()
+	if kv.killed() {
+		return
 	}
+
+	command := Op{
+		Type:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		SeqId:    args.SeqId,
+		ClientId: args.ClientId,
+	}
+
+	kv.mu.Lock()
+	if record, ok := kv.recordMap[args.ClientId]; ok && args.SeqId <= record.LastSeqId {
+		reply.Err = record.LastReply.Err
+		kv.mu.Unlock()
+		return
+	}
+
+	index, startTerm, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.LeaderId = kv.leaderId
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	opreply, err := kv.waitApplied(index, startTerm)
+
+	kv.mu.Lock()
+	delete(kv.notifyChans, index)
+	if err == OK {
+		reply.Err = opreply.Err
+		kv.leaderId = kv.me
+	} else {
+		reply.Err = err
+	}
+	kv.mu.Unlock()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -171,6 +211,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
+// Rf exposes the underlying Raft instance for labrpc wiring.
+func (kv *KVServer) Rf() *raft.Raft {
+	return kv.rf
+}
+
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -197,8 +242,6 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
-
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
@@ -299,6 +342,8 @@ func (kv *KVServer) applyToStateMachine(cmd Op) OpReply {
 		reply = kv.putHandler(cmd)
 	case "Append":
 		reply = kv.appendHandler(cmd)
+	case "Delete":
+		reply = kv.deleteHandler(cmd)
 	}
 	return reply
 }
@@ -329,6 +374,11 @@ func (kv *KVServer) putHandler(cmd Op) OpReply {
 	}
 	return reply
 }
+func (kv *KVServer) deleteHandler(cmd Op) OpReply {
+	delete(kv.kvStore, cmd.Key)
+	return OpReply{Err: OK}
+}
+
 func (kv *KVServer) appendHandler(cmd Op) OpReply {
 	var reply OpReply
 	kv.kvStore[cmd.Key] += cmd.Value

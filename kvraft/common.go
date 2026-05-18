@@ -5,6 +5,7 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeOut     = "ErrTimeOut"
+	ErrBadRequest  = "ErrBadRequest"
 )
 
 type Err string
@@ -30,11 +31,21 @@ type GetArgs struct {
 	Key      string
 	SeqId    int
 	ClientId int64
-	// You'll have to add definitions here.
 }
 
 type GetReply struct {
 	Err      Err
 	Value    string
+	LeaderId int
+}
+
+type DeleteArgs struct {
+	Key      string
+	SeqId    int
+	ClientId int64
+}
+
+type DeleteReply struct {
+	Err      Err
 	LeaderId int
 }
