@@ -64,6 +64,7 @@ func (c *Cluster) startServer(i int, maxRaftState int) error {
 	c.saved[i] = raft.MakePersister()
 	c.kv[i] = kvraft.StartKVServer(ends, i, c.saved[i], maxRaftState)
 
+	// start kvserver and raft rpc service and plug into server
 	kvsvc := labrpc.MakeService(c.kv[i])
 	rfsvc := labrpc.MakeService(c.kv[i].Rf())
 	srv := labrpc.MakeServer()

@@ -3,29 +3,56 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"infra/controlplane/kvclient"
+	"infra/models"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
-
-	"infra/controlplane/kvclient"
-	"infra/models"
+	"time"
 )
 
 const workersIndexKey = "workers/index"
 
 // Controller receives worker registrations and persists metadata in the Raft KV cluster.
 type Controller struct {
-	kv   *kvclient.Client
-	mu   sync.Mutex
-	seen map[string]struct{}
+	kv       *kvclient.Client
+	mu       sync.Mutex
+	seen     map[string]struct{}
+	lastseen map[string]time.Time
 }
 
 // New creates a controller backed by the given KV server HTTP endpoints.
 func New(kvAddrs []string) *Controller {
-	return &Controller{
-		kv:   kvclient.New(kvAddrs),
-		seen: make(map[string]struct{}),
+	c := &Controller{
+		kv:       kvclient.New(kvAddrs),
+		seen:     make(map[string]struct{}),
+		lastseen: make(map[string]time.Time),
+	}
+	go c.startHeartbeatChecker(2 * time.Second)
+
+	return c
+}
+
+func (c *Controller) startHeartbeatChecker(timeout time.Duration) {
+	ticker := time.NewTicker(timeout)
+	for range ticker.C {
+		hasChange := false
+		c.mu.Lock()
+		for id, lasttime := range c.lastseen {
+			if time.Since(lasttime) > timeout {
+				log.Printf("[Controller] worker %s timeout\n", id)
+				hasChange = true
+				delete(c.seen, id)
+				delete(c.lastseen, id)
+			}
+
+		}
+		if hasChange == true {
+			_ = c.saveIndexLocked()
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -40,12 +67,35 @@ func (c *Controller) RegisterWorker(info models.WorkerInfo) error {
 	if err := c.kv.Put(key, string(data)); err != nil {
 		return err
 	}
+	log.Printf("[Controller] Node [%s] (IP: %s) registered with %d GPU(s)",
+		info.ID, info.IP, len(info.GPUs))
+
+	for _, gpu := range info.GPUs {
+		log.Printf("  ├── [GPU #%d] Model: %s | Memory: %d MB | Utilization: %.2f%%",
+			gpu.ID,
+			gpu.Model,
+			gpu.MemoryMB,
+			gpu.Utilization*100,
+		)
+	}
+	c.mu.Lock()
+	c.lastseen[info.ID] = time.Now()
+	c.mu.Unlock()
+	// write to local cache
 	return c.addToIndex(info.ID)
 }
 
 // Heartbeat updates an existing worker record (status, GPUs, etc.).
 func (c *Controller) Heartbeat(info models.WorkerInfo) error {
-	return c.RegisterWorker(info)
+	err := c.addToIndex(info.ID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.lastseen[info.ID] = time.Now()
+	c.mu.Unlock()
+	log.Printf("[Controller] receive heartbeat from node %s\n", info.ID)
+	return err
 }
 
 // GetWorker loads one worker record from KV.
@@ -160,6 +210,7 @@ func (c *Controller) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	// get workerinfo
 	info, err := decodeWorker(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)

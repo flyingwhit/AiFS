@@ -15,10 +15,10 @@ import (
 
 // Client talks to the Raft KV cluster over HTTP POST /kv.
 type Client struct {
-	addrs  []string
-	curr   int
-	mu     sync.Mutex
-	http   *http.Client
+	addrs []string
+	curr  int
+	mu    sync.Mutex
+	http  *http.Client // http keep alive ()
 }
 
 // New creates a client with a round-robin list of KV server base URLs.
@@ -57,6 +57,7 @@ func (c *Client) doOnce(addr string, req kvraft.HTTPRequest) (kvraft.HTTPRespons
 	}
 
 	url := addr + "/kv"
+	// prepare httpReq without sending
 	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return kvraft.HTTPResponse{}, err
@@ -86,6 +87,7 @@ func (c *Client) execute(req kvraft.HTTPRequest) (kvraft.HTTPResponse, error) {
 		return kvraft.HTTPResponse{}, fmt.Errorf("no kv server addresses configured")
 	}
 
+	// round-robin
 	tries := len(c.addrs)
 	for i := 0; i < tries; i++ {
 		addr := c.nextAddr()

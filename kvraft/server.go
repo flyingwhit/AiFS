@@ -306,6 +306,7 @@ func (kv *KVServer) applier() {
 
 			if notifyChan, ok := kv.notifyChans[idx]; ok {
 				notifyChan <- reply
+				log.Printf("[KVServer] KVServer %d\nHandle %s request\nKey: %s\nValue: %s\n", kv.me, cmd.Type, cmd.Key, cmd.Value)
 			}
 			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
@@ -338,8 +339,10 @@ func (kv *KVServer) applyToStateMachine(cmd Op) OpReply {
 	switch cmd.Type {
 	case "Get":
 		reply = kv.getHandler(cmd)
+		// log.Printf("[KVServer] Handle Get request")
 	case "Put":
 		reply = kv.putHandler(cmd)
+		// log.Printf("[KVServer] KVServer: %d handle Put request\nKey: %s\nValue: %s", kv.me, cmd.Key, cmd.Value)
 	case "Append":
 		reply = kv.appendHandler(cmd)
 	case "Delete":
