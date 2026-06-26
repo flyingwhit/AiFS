@@ -70,7 +70,7 @@ POST /workers/heartbeat
 GET  /workers
 ~~~
 
-员工定期发送心跳(heartbeat)，如果controller一定时间未收到，则将员工标记为unhealthy状态
+员工定期发送心跳(heartbeat)，如果controller一定时间未收到，则将员工标记为删除状态
 
 **phase3**:
 

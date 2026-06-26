@@ -15,10 +15,12 @@ import (
 
 // Client talks to the Raft KV cluster over HTTP POST /kv.
 type Client struct {
-	addrs []string
-	curr  int
-	mu    sync.Mutex
-	http  *http.Client // http keep alive ()
+	addrs    []string
+	curr     int
+	clientID int64
+	seqID    int
+	mu       sync.Mutex
+	http     *http.Client // http keep alive ()
 }
 
 // New creates a client with a round-robin list of KV server base URLs.
@@ -32,7 +34,8 @@ func New(addrs []string) *Client {
 		normalized = append(normalized, a)
 	}
 	return &Client{
-		addrs: normalized,
+		addrs:    normalized,
+		clientID: time.Now().UnixNano(),
 		http: &http.Client{
 			Timeout: 2 * time.Second,
 		},
@@ -48,6 +51,15 @@ func (c *Client) nextAddr() string {
 	addr := c.addrs[c.curr]
 	c.curr = (c.curr + 1) % len(c.addrs)
 	return addr
+}
+
+func (c *Client) prepareRequest(req kvraft.HTTPRequest) kvraft.HTTPRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seqID++
+	req.ClientID = c.clientID
+	req.SeqID = c.seqID
+	return req
 }
 
 func (c *Client) doOnce(addr string, req kvraft.HTTPRequest) (kvraft.HTTPResponse, error) {
@@ -86,6 +98,7 @@ func (c *Client) execute(req kvraft.HTTPRequest) (kvraft.HTTPResponse, error) {
 	if len(c.addrs) == 0 {
 		return kvraft.HTTPResponse{}, fmt.Errorf("no kv server addresses configured")
 	}
+	req = c.prepareRequest(req)
 
 	// round-robin
 	tries := len(c.addrs)

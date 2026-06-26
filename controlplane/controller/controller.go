@@ -30,7 +30,7 @@ func New(kvAddrs []string) *Controller {
 		seen:     make(map[string]struct{}),
 		lastseen: make(map[string]time.Time),
 	}
-	go c.startHeartbeatChecker(2 * time.Second)
+	go c.startHeartbeatChecker(6 * time.Second)
 
 	return c
 }
@@ -79,20 +79,19 @@ func (c *Controller) RegisterWorker(info models.WorkerInfo) error {
 		)
 	}
 	c.mu.Lock()
+	c.seen[info.ID] = struct{}{}
 	c.lastseen[info.ID] = time.Now()
+	err = c.saveIndexLocked()
 	c.mu.Unlock()
-	// write to local cache
-	return c.addToIndex(info.ID)
+	return err
 }
 
 // Heartbeat updates an existing worker record (status, GPUs, etc.).
 func (c *Controller) Heartbeat(info models.WorkerInfo) error {
-	err := c.addToIndex(info.ID)
-	if err != nil {
-		return err
-	}
 	c.mu.Lock()
+	c.seen[info.ID] = struct{}{}
 	c.lastseen[info.ID] = time.Now()
+	err := c.saveIndexLocked()
 	c.mu.Unlock()
 	log.Printf("[Controller] receive heartbeat from node %s\n", info.ID)
 	return err
@@ -112,6 +111,66 @@ func (c *Controller) GetWorker(id string) (models.WorkerInfo, error) {
 		return models.WorkerInfo{}, err
 	}
 	return info, nil
+}
+
+// PickBestWorker returns the alive worker with lowest GPU utilization (idle preferred).
+func (c *Controller) PickBestWorker() (models.WorkerInfo, error) {
+	workers, err := c.ListWorkers()
+	if err != nil {
+		return models.WorkerInfo{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if best, ok := pickLowestLoadWorker(workers, c.seen, true); ok {
+		return best, nil
+	}
+
+	// Controller memory is intentionally volatile. If the process restarted
+	// or the heartbeat checker briefly removed an entry, fall back to the
+	// strongly-consistent KV worker list instead of making Gateway fail while
+	// /workers still shows routable nodes.
+	if best, ok := pickLowestLoadWorker(workers, nil, false); ok {
+		return best, nil
+	}
+	return models.WorkerInfo{}, fmt.Errorf("no available worker")
+}
+
+func pickLowestLoadWorker(workers []models.WorkerInfo, seen map[string]struct{}, requireSeen bool) (models.WorkerInfo, bool) {
+	var best models.WorkerInfo
+	bestScore := 0.0
+	found := false
+
+	for _, w := range workers {
+		if requireSeen {
+			if _, ok := seen[w.ID]; !ok {
+				continue
+			}
+		}
+		if w.Status == models.WorkerOffline {
+			continue
+		}
+		score := workerLoadScore(w)
+		if !found || score < bestScore {
+			best = w
+			bestScore = score
+			found = true
+		}
+	}
+	return best, found
+}
+
+func workerLoadScore(w models.WorkerInfo) float64 {
+	if w.Status == models.WorkerBusy {
+		return 1000
+	}
+	maxUtil := 0.0
+	for _, g := range w.GPUs {
+		if g.Utilization > maxUtil {
+			maxUtil = g.Utilization
+		}
+	}
+	return maxUtil
 }
 
 // ListWorkers returns all registered workers.
@@ -191,6 +250,8 @@ func (c *Controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.handleHeartbeat(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/workers":
 		c.handleList(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/workers/best":
+		c.handleBest(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -221,6 +282,15 @@ func (c *Controller) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "id": info.ID})
+}
+
+func (c *Controller) handleBest(w http.ResponseWriter, r *http.Request) {
+	winfo, err := c.PickBestWorker()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, winfo)
 }
 
 func (c *Controller) handleList(w http.ResponseWriter, r *http.Request) {
@@ -263,10 +333,13 @@ func StartHTTPServer(c *Controller, addr string) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/workers/register", c)
 	mux.Handle("/workers/heartbeat", c)
+	mux.Handle("/workers/best", c)
 	mux.Handle("/workers", c)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
-		_ = srv.ListenAndServe()
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[Controller] HTTP listen failed on %s: %v", addr, err)
+		}
 	}()
 	return srv
 }

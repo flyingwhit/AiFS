@@ -1,0 +1,8 @@
+.git
+.gitignore
+docs/.obsidian
+tmp
+*.log
+.DS_Store
+graph
+images

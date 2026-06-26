@@ -1,0 +1,104 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command:
+      - "--model"
+      - "Qwen/Qwen3-0.6B"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--max-model-len"
+      - "4096"
+      - "--gpu-memory-utilization"
+      - "0.85"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: on-failure
+
+  kvserver:
+    build:
+      context: .
+      args:
+        SERVICE: kvcluster
+    command: ["-port", "8001"]
+    ports:
+      - "8001:8001"
+      - "8002:8002"
+      - "8003:8003"
+
+  controller:
+    build:
+      context: .
+      args:
+        SERVICE: controller
+    command:
+      - "-addr"
+      - ":9000"
+      - "-kv"
+      - "http://kvserver:8001,http://kvserver:8002,http://kvserver:8003"
+    ports:
+      - "9000:9000"
+    depends_on:
+      - kvserver
+    restart: on-failure
+
+  worker:
+    build:
+      context: .
+      args:
+        SERVICE: worker
+    command:
+      - "-controller"
+      - "http://controller:9000"
+      - "-ip"
+      - "worker"
+      - "-port"
+      - "9100"
+      - "-gpus"
+      - "2"
+      - "-interval"
+      - "2s"
+      - "-backend"
+      - "vllm"
+      - "-vllm-url"
+      - "http://vllm:8000"
+      - "-model"
+      - "Qwen/Qwen3-0.6B"
+      - "-max-tokens"
+      - "256"
+    ports:
+      - "9100:9100"
+    depends_on:
+      - controller
+      - vllm
+    restart: on-failure
+
+  gateway:
+    build:
+      context: .
+      args:
+        SERVICE: gateway
+    command:
+      - "-addr"
+      - ":8080"
+      - "-controller"
+      - "http://controller:9000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - controller
+      - worker
+    restart: on-failure

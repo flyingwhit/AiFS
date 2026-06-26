@@ -3,6 +3,7 @@ package kvraft
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"sync/atomic"
 )
@@ -11,9 +12,11 @@ const httpClientID int64 = 0xA1F5
 
 // HTTPRequest is the JSON body for POST /kv.
 type HTTPRequest struct {
-	Op    string `json:"op"`
-	Key   string `json:"key"`
-	Value string `json:"value,omitempty"`
+	Op       string `json:"op"`
+	Key      string `json:"key"`
+	Value    string `json:"value,omitempty"`
+	ClientID int64  `json:"client_id,omitempty"`
+	SeqID    int    `json:"seq_id,omitempty"`
 }
 
 // HTTPResponse is the JSON body returned by POST /kv.
@@ -29,19 +32,24 @@ func (kv *KVServer) nextHTTPSeq() int {
 
 func (kv *KVServer) executeHTTP(op, key, value string) HTTPResponse {
 	seq := kv.nextHTTPSeq()
+	clientID := httpClientID
+	return kv.executeHTTPWithClient(op, key, value, clientID, seq)
+}
+
+func (kv *KVServer) executeHTTPWithClient(op, key, value string, clientID int64, seq int) HTTPResponse {
 	switch op {
 	case "get":
-		args := GetArgs{Key: key, SeqId: seq, ClientId: httpClientID}
+		args := GetArgs{Key: key, SeqId: seq, ClientId: clientID}
 		reply := GetReply{}
 		kv.Get(&args, &reply)
 		return httpResponseFromErr(reply.Err, reply.Value)
 	case "put":
-		args := PutAppendArgs{Key: key, Value: value, Op: "Put", SeqId: seq, ClientId: httpClientID}
+		args := PutAppendArgs{Key: key, Value: value, Op: "Put", SeqId: seq, ClientId: clientID}
 		reply := PutAppendReply{}
 		kv.PutAppend(&args, &reply)
 		return httpResponseFromErr(reply.Err, "")
 	case "delete":
-		args := DeleteArgs{Key: key, SeqId: seq, ClientId: httpClientID}
+		args := DeleteArgs{Key: key, SeqId: seq, ClientId: clientID}
 		reply := DeleteReply{}
 		kv.Delete(&args, &reply)
 		return httpResponseFromErr(reply.Err, "")
@@ -83,7 +91,14 @@ func (kv *KVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := kv.executeHTTP(req.Op, req.Key, req.Value)
+	clientID := req.ClientID
+	seqID := req.SeqID
+	if clientID == 0 || seqID == 0 {
+		clientID = httpClientID
+		seqID = kv.nextHTTPSeq()
+	}
+
+	resp := kv.executeHTTPWithClient(req.Op, req.Key, req.Value, clientID, seqID)
 	w.Header().Set("Content-Type", "application/json")
 	if resp.Err == string(ErrWrongLeader) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -101,7 +116,9 @@ func StartHTTPServer(kv *KVServer, addr string) *http.Server {
 	mux.Handle("/kv", kv)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
-		_ = srv.ListenAndServe()
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[KVServer] HTTP listen failed on %s: %v", addr, err)
+		}
 	}()
 	return srv
 }
